@@ -1,378 +1,423 @@
-import streamlit as st
+import io
 import numpy as np
-import plotly.graph_objects as go
-import requests
-from PIL import Image
-import math
-from io import BytesIO
+import pandas as pd
+import rasterio
+import matplotlib.pyplot as plt
+import streamlit as st
+from matplotlib.patches import Patch
 
-st.set_page_config(page_title="Wasatch Slope Map", layout="wide")
-st.title("🏔️ Wasatch 3D Avalanche Slope Map")
-st.write("Loading real Wasatch elevation data piece by piece.")
+st.set_page_config(page_title="Wasatch Avalanche Overlay", layout="wide")
 
-# ------------------------------------------------------------
-# 1. SLIPPY MAP MATH
-# ------------------------------------------------------------
+# ============================================================
+# CONSTANTS
+# ============================================================
+ALPHA_DANGER = 0.65
+ALPHA_SLOPE = 0.20
 
-def latlon_to_tile(lat_deg, lon_deg, zoom):
-    lat_rad = math.radians(lat_deg)
-    n = 2.0 ** zoom
+DANGER_COLORS = {
+    "No Rating":    (0.0, 0.0, 0.0, 0.0),
+    "Low":          (102/255, 204/255, 0/255, ALPHA_DANGER),    # green
+    "Moderate":     (255/255, 204/255, 0/255, ALPHA_DANGER),    # yellow
+    "Considerable": (255/255, 153/255, 0/255, ALPHA_DANGER),    # orange
+    "High":         (255/255, 0/255, 0/255, ALPHA_DANGER),      # red
+    "Extreme":      (0/255, 0/255, 0/255, ALPHA_DANGER),        # black
+}
 
-    xtile = int((lon_deg + 180.0) / 360.0 * n)
-    ytile = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+DANGER_RANK = {
+    "No Rating": 0,
+    "Low": 1,
+    "Moderate": 2,
+    "Considerable": 3,
+    "High": 4,
+    "Extreme": 5,
+}
 
-    return xtile, ytile
+
+# ============================================================
+# TERRAIN FUNCTIONS
+# ============================================================
+def compute_slope_aspect(dem_array, xres, yres):
+    """
+    Compute slope (degrees) and aspect (degrees clockwise from north)
+    using raster gradients.
+    """
+    dz_dy, dz_dx = np.gradient(dem_array, yres, xres)
+
+    slope_rad = np.arctan(np.sqrt(dz_dx**2 + dz_dy**2))
+    slope_deg = np.degrees(slope_rad)
+
+    # Aspect as degrees clockwise from north
+    aspect_rad = np.arctan2(dz_dx, -dz_dy)
+    aspect_deg = np.degrees(aspect_rad)
+    aspect_deg = np.where(aspect_deg < 0, 360 + aspect_deg, aspect_deg)
+
+    return slope_deg, aspect_deg
 
 
-def get_tile_url(x, y, zoom):
-    return f"https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{zoom}/{x}/{y}.png"
+def hillshade(dem, xres, yres, azimuth=315, altitude=45):
+    """
+    Create a grayscale hillshade for topo-style background.
+    """
+    azimuth_rad = np.radians(azimuth)
+    altitude_rad = np.radians(altitude)
+
+    dz_dy, dz_dx = np.gradient(dem, yres, xres)
+    slope = np.pi / 2.0 - np.arctan(np.sqrt(dz_dx**2 + dz_dy**2))
+    aspect = np.arctan2(-dz_dx, dz_dy)
+
+    shaded = (
+        np.sin(altitude_rad) * np.sin(slope)
+        + np.cos(altitude_rad) * np.cos(slope) * np.cos(azimuth_rad - aspect)
+    )
+
+    shaded = np.nan_to_num(shaded, nan=np.nanmin(shaded))
+    if shaded.max() != shaded.min():
+        shaded = (shaded - shaded.min()) / (shaded.max() - shaded.min())
+    else:
+        shaded = np.zeros_like(shaded)
+
+    return shaded
 
 
-def decode_terrarium_tile(img):
-    img_array = np.array(img)
+def elevation_band_mask(dem_array, band_name, lower_max, middle_max):
+    """
+    Convert Lower/Middle/Upper to DEM-based elevation masks.
+    """
+    band_name = str(band_name).strip().lower()
 
-    R = img_array[:, :, 0].astype(np.float32)
-    G = img_array[:, :, 1].astype(np.float32)
-    B = img_array[:, :, 2].astype(np.float32)
+    if band_name == "lower":
+        return dem_array < lower_max
+    elif band_name == "middle":
+        return (dem_array >= lower_max) & (dem_array < middle_max)
+    elif band_name == "upper":
+        return dem_array >= middle_max
+    else:
+        raise ValueError(f"Unknown elevation band: {band_name}")
 
-    elevation = (R * 256.0 + G + B / 256.0) - 32768.0
-    return elevation
+
+def aspect_mask(aspect_array, aspect_label):
+    """
+    Return mask for one of the 8 aspect bins:
+    N, NE, E, SE, S, SW, W, NW
+    """
+    aspect_label = str(aspect_label).strip().upper()
+
+    bins = {
+        "N":  [(337.5, 360.0), (0.0, 22.5)],
+        "NE": [(22.5, 67.5)],
+        "E":  [(67.5, 112.5)],
+        "SE": [(112.5, 157.5)],
+        "S":  [(157.5, 202.5)],
+        "SW": [(202.5, 247.5)],
+        "W":  [(247.5, 292.5)],
+        "NW": [(292.5, 337.5)],
+    }
+
+    if aspect_label not in bins:
+        raise ValueError(f"Unknown aspect label: {aspect_label}")
+
+    mask = np.zeros(aspect_array.shape, dtype=bool)
+
+    for lo, hi in bins[aspect_label]:
+        if lo < hi:
+            mask |= (aspect_array >= lo) & (aspect_array < hi)
+        else:
+            # wrap-around range
+            mask |= (aspect_array >= lo) | (aspect_array < hi)
+
+    return mask
 
 
 @st.cache_data(show_spinner=False)
-def download_tile(x, y, zoom):
-    url = get_tile_url(x, y, zoom)
+def load_excel_data(excel_file):
+    danger_df = pd.read_excel(excel_file, sheet_name="DangerRose", engine="openpyxl")
+    danger_df.columns = [c.strip() for c in danger_df.columns]
 
-    response = requests.get(url, timeout=20)
-    response.raise_for_status()
+    danger_df["region"] = danger_df["region"].astype(str).str.strip().str.lower()
+    danger_df["aspect"] = danger_df["aspect"].astype(str).str.strip().str.upper()
+    danger_df["elevation"] = danger_df["elevation"].astype(str).str.strip()
+    danger_df["danger_label"] = danger_df["danger_label"].astype(str).str.strip()
+    danger_df["forecast_date"] = pd.to_datetime(
+        danger_df["forecast_date"]
+    ).dt.strftime("%Y-%m-%d")
 
-    img = Image.open(BytesIO(response.content)).convert("RGB")
-    elevation = decode_terrarium_tile(img)
-
-    return elevation
-
-
-# ------------------------------------------------------------
-# 2. CREATE TILE LIST FOR A BOUNDING BOX
-# ------------------------------------------------------------
-
-def get_tile_grid(north, south, west, east, zoom):
-    x_min, y_max = latlon_to_tile(south, west, zoom)
-    x_max, y_min = latlon_to_tile(north, east, zoom)
-
-    tile_list = []
-
-    for y in range(y_min, y_max + 1):
-        for x in range(x_min, x_max + 1):
-            tile_list.append((x, y))
-
-    return tile_list, x_min, x_max, y_min, y_max
+    return danger_df
 
 
-def stitch_loaded_tiles(loaded_tiles, x_min, x_max, y_min, y_max):
-    """
-    Creates a DEM mosaic from loaded tiles.
-    Missing tiles are filled with NaN so the map can render partially.
-    """
+@st.cache_data(show_spinner=False)
+def read_dem(uploaded_dem_bytes):
+    with rasterio.io.MemoryFile(uploaded_dem_bytes) as memfile:
+        with memfile.open() as src:
+            dem = src.read(1).astype("float32")
+            transform = src.transform
+            bounds = src.bounds
+            xres = abs(transform.a)
+            yres = abs(transform.e)
+            nodata = src.nodata
+            crs = src.crs
 
-    rows = []
+    if nodata is not None:
+        dem = np.where(dem == nodata, np.nan, dem)
 
-    for y in range(y_min, y_max + 1):
-        row_tiles = []
+    extent = [bounds.left, bounds.right, bounds.bottom, bounds.top]
 
-        for x in range(x_min, x_max + 1):
-            key = f"{x}_{y}"
-
-            if key in loaded_tiles:
-                row_tiles.append(loaded_tiles[key])
-            else:
-                row_tiles.append(np.full((256, 256), np.nan, dtype=np.float32))
-
-        rows.append(np.hstack(row_tiles))
-
-    Z = np.vstack(rows)
-    return Z
-
-
-# ------------------------------------------------------------
-# 3. SIDEBAR CONTROLS
-# ------------------------------------------------------------
-
-st.sidebar.header("Map Area")
-
-area_choice = st.sidebar.selectbox(
-    "Choose Region",
-    [
-        "Wasatch Front",
-        "Central Wasatch",
-        "Mount Timpanogos",
-        "Little Cottonwood / Big Cottonwood",
-        "Custom"
-    ]
-)
-
-if area_choice == "Wasatch Front":
-    north, south, west, east = 41.35, 39.95, -112.15, -111.35
-    zoom = 10
-
-elif area_choice == "Central Wasatch":
-    north, south, west, east = 40.85, 40.45, -111.95, -111.45
-    zoom = 11
-
-elif area_choice == "Mount Timpanogos":
-    north, south, west, east = 40.50, 40.25, -111.80, -111.45
-    zoom = 12
-
-elif area_choice == "Little Cottonwood / Big Cottonwood":
-    north, south, west, east = 40.72, 40.50, -111.90, -111.55
-    zoom = 12
-
-else:
-    north = st.sidebar.number_input("North Latitude", value=41.35)
-    south = st.sidebar.number_input("South Latitude", value=39.95)
-    west = st.sidebar.number_input("West Longitude", value=-112.15)
-    east = st.sidebar.number_input("East Longitude", value=-111.35)
-    zoom = st.sidebar.slider("Zoom", 9, 13, 10)
-
-st.sidebar.header("Tile Loading")
-
-tiles_per_click = st.sidebar.slider(
-    "Tiles to load per click",
-    min_value=1,
-    max_value=20,
-    value=6,
-    step=1
-)
-
-downsample = st.sidebar.slider(
-    "Downsample factor",
-    min_value=1,
-    max_value=8,
-    value=2,
-    step=1,
-    help="Higher values render faster but reduce visual detail."
-)
-
-st.sidebar.header("Slope Controls")
-
-danger_min = st.sidebar.slider("Minimum Angle", 0, 60, 30)
-danger_max = st.sidebar.slider("Maximum Angle", 0, 90, 45)
-
-st.sidebar.header("Topo Line Controls")
-
-show_topo_lines = st.sidebar.checkbox("Show Elevation Topo Lines", value=True)
-
-contour_interval = st.sidebar.slider(
-    "Elevation Contour Interval, meters",
-    min_value=20,
-    max_value=250,
-    value=50,
-    step=10
-)
+    return {
+        "dem": dem,
+        "transform": transform,
+        "bounds": bounds,
+        "extent": extent,
+        "xres": xres,
+        "yres": yres,
+        "crs": str(crs) if crs else None,
+    }
 
 
-# ------------------------------------------------------------
-# 4. INITIALIZE SESSION STATE
-# ------------------------------------------------------------
+def build_map(
+    dem,
+    extent,
+    xres,
+    yres,
+    region,
+    forecast_date,
+    danger_today,
+    lower_max,
+    middle_max,
+    slope_min,
+    slope_max,
+    show_slope_layer,
+    show_danger_layer,
+):
+    # --------------------------------------------------------
+    # Terrain derivatives
+    # --------------------------------------------------------
+    slope_deg, aspect_deg = compute_slope_aspect(dem, xres, yres)
+    slope_mask = (slope_deg >= slope_min) & (slope_deg <= slope_max) & np.isfinite(dem)
 
-tile_list, x_min, x_max, y_min, y_max = get_tile_grid(
-    north=north,
-    south=south,
-    west=west,
-    east=east,
-    zoom=zoom
-)
+    # --------------------------------------------------------
+    # Background
+    # --------------------------------------------------------
+    dem_filled = np.where(np.isfinite(dem), dem, np.nanmedian(dem))
+    shade = hillshade(dem_filled, xres, yres)
 
-map_key = f"{area_choice}_{north}_{south}_{west}_{east}_{zoom}"
-
-if "map_key" not in st.session_state:
-    st.session_state.map_key = map_key
-
-if st.session_state.map_key != map_key:
-    st.session_state.map_key = map_key
-    st.session_state.loaded_tiles = {}
-    st.session_state.next_tile_index = 0
-
-if "loaded_tiles" not in st.session_state:
-    st.session_state.loaded_tiles = {}
-
-if "next_tile_index" not in st.session_state:
-    st.session_state.next_tile_index = 0
-
-
-# ------------------------------------------------------------
-# 5. LOAD TILES PIECE BY PIECE
-# ------------------------------------------------------------
-
-total_tiles = len(tile_list)
-loaded_count = len(st.session_state.loaded_tiles)
-
-st.info(f"Loaded {loaded_count} of {total_tiles} tiles.")
-
-progress_value = 0 if total_tiles == 0 else loaded_count / total_tiles
-st.progress(progress_value)
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    load_more = st.button("Load More Tiles")
-
-with col2:
-    load_all = st.button("Load All Remaining")
-
-with col3:
-    reset_tiles = st.button("Reset Loaded Tiles")
-
-if reset_tiles:
-    st.session_state.loaded_tiles = {}
-    st.session_state.next_tile_index = 0
-    st.rerun()
-
-if load_more or load_all:
-    if load_all:
-        number_to_load = total_tiles - st.session_state.next_tile_index
+    dem_norm = dem_filled.copy()
+    dem_min = np.nanmin(dem_norm)
+    dem_max = np.nanmax(dem_norm)
+    if dem_max > dem_min:
+        dem_norm = (dem_norm - dem_min) / (dem_max - dem_min)
     else:
-        number_to_load = tiles_per_click
+        dem_norm = np.zeros_like(dem_norm)
 
-    start_index = st.session_state.next_tile_index
-    end_index = min(start_index + number_to_load, total_tiles)
+    # --------------------------------------------------------
+    # Avalanche danger layer
+    # --------------------------------------------------------
+    danger_rank_grid = np.zeros(dem.shape, dtype=np.uint8)
+    danger_label_grid = np.full(dem.shape, "No Rating", dtype=object)
 
-    with st.spinner(f"Downloading tiles {start_index + 1} to {end_index} of {total_tiles}..."):
-        for i in range(start_index, end_index):
-            x, y = tile_list[i]
-            key = f"{x}_{y}"
+    for _, row in danger_today.iterrows():
+        elev_class = row["elevation"]
+        asp_class = row["aspect"]
+        danger_label = row["danger_label"]
 
-            if key not in st.session_state.loaded_tiles:
-                try:
-                    elevation_tile = download_tile(x, y, zoom)
-                    st.session_state.loaded_tiles[key] = elevation_tile
-                except Exception as e:
-                    st.warning(f"Could not load tile {x}, {y}: {e}")
+        elev_mask = elevation_band_mask(dem, elev_class, lower_max, middle_max)
+        asp_mask = aspect_mask(aspect_deg, asp_class)
 
-        st.session_state.next_tile_index = end_index
+        combined_mask = slope_mask & elev_mask & asp_mask
 
-    st.rerun()
+        incoming_rank = DANGER_RANK.get(danger_label, 0)
+        replace_mask = combined_mask & (incoming_rank > danger_rank_grid)
 
+        danger_rank_grid[replace_mask] = incoming_rank
+        danger_label_grid[replace_mask] = danger_label
 
-# ------------------------------------------------------------
-# 6. RENDER ONLY IF SOMETHING HAS LOADED
-# ------------------------------------------------------------
+    danger_overlay = np.zeros((dem.shape[0], dem.shape[1], 4), dtype=np.float32)
+    for label, rgba in DANGER_COLORS.items():
+        mask = danger_label_grid == label
+        danger_overlay[mask, 0] = rgba[0]
+        danger_overlay[mask, 1] = rgba[1]
+        danger_overlay[mask, 2] = rgba[2]
+        danger_overlay[mask, 3] = rgba[3]
 
-if len(st.session_state.loaded_tiles) == 0:
-    st.warning("No tiles loaded yet. Click **Load More Tiles** to begin.")
-    st.stop()
+    # --------------------------------------------------------
+    # Slope mask layer
+    # --------------------------------------------------------
+    slope_overlay = np.zeros((dem.shape[0], dem.shape[1], 4), dtype=np.float32)
+    slope_overlay[slope_mask] = (0.2, 0.5, 1.0, ALPHA_SLOPE)
 
-Z = stitch_loaded_tiles(
-    st.session_state.loaded_tiles,
-    x_min=x_min,
-    x_max=x_max,
-    y_min=y_min,
-    y_max=y_max
-)
+    # --------------------------------------------------------
+    # Plot
+    # --------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(10, 10))
 
-# Downsample for faster rendering.
-Z = Z[::downsample, ::downsample]
+    # base topo
+    ax.imshow(shade, cmap="gray", extent=extent, origin="upper")
+    ax.imshow(dem_norm, cmap="terrain", extent=extent, origin="upper", alpha=0.18)
 
-# Approx meters per pixel.
-center_lat = (north + south) / 2
-base_meters_per_pixel = 156543.03392 / (2 ** zoom)
+    # optional layers
+    if show_slope_layer:
+        ax.imshow(slope_overlay, extent=extent, origin="upper")
 
-dx = base_meters_per_pixel * math.cos(math.radians(center_lat)) * downsample
-dy = base_meters_per_pixel * downsample
+    if show_danger_layer:
+        ax.imshow(danger_overlay, extent=extent, origin="upper")
 
-x_dist = np.arange(Z.shape[1]) * dx
-y_dist = np.arange(Z.shape[0]) * dy
-X, Y = np.meshgrid(x_dist, y_dist)
-
-# Fill NaNs temporarily for gradient calculation.
-# Plotly will still skip NaN areas in the surface.
-Z_for_gradient = np.copy(Z)
-nan_mask = np.isnan(Z_for_gradient)
-
-if np.any(~nan_mask):
-    Z_for_gradient[nan_mask] = np.nanmean(Z_for_gradient)
-else:
-    st.warning("Loaded tiles contain no valid elevation data.")
-    st.stop()
-
-dz_dy, dz_dx = np.gradient(Z_for_gradient, dy, dx)
-
-slope_deg = np.degrees(
-    np.arctan(
-        np.sqrt(dz_dx**2 + dz_dy**2)
+    ax.set_title(
+        f"Wasatch Avalanche Overlay\n"
+        f"Region: {region} | Date: {forecast_date}\n"
+        f"Danger shown only on slopes between {slope_min}° and {slope_max}°"
     )
+    ax.set_xlabel("Map X")
+    ax.set_ylabel("Map Y")
+
+    legend_items = []
+
+    if show_danger_layer:
+        legend_items.extend([
+            Patch(facecolor=DANGER_COLORS["Low"], edgecolor="black", label="Low"),
+            Patch(facecolor=DANGER_COLORS["Moderate"], edgecolor="black", label="Moderate"),
+            Patch(facecolor=DANGER_COLORS["Considerable"], edgecolor="black", label="Considerable"),
+            Patch(facecolor=DANGER_COLORS["High"], edgecolor="black", label="High"),
+        ])
+
+    if show_slope_layer:
+        legend_items.append(
+            Patch(facecolor=(0.2, 0.5, 1.0, ALPHA_SLOPE), edgecolor="black", label=f"{slope_min}–{slope_max}° slope mask")
+        )
+
+    if legend_items:
+        ax.legend(handles=legend_items, loc="lower left")
+
+    plt.tight_layout()
+    return fig, slope_deg, aspect_deg, slope_mask
+
+
+# ============================================================
+# UI
+# ============================================================
+st.title("Wasatch Avalanche Terrain Overlay")
+st.markdown(
+    """
+Upload:
+1. a **DEM GeoTIFF** for the Wasatch  
+2. your **avalanche_forecasts.xlsx** workbook
+
+The app will compute:
+- slope
+- aspect
+- 30–45° slope mask (or your chosen range)
+- avalanche danger overlay by **aspect** and **elevation band**
+"""
 )
 
-slope_deg[nan_mask] = np.nan
+with st.sidebar:
+    st.header("Inputs")
+
+    dem_file = st.file_uploader("Upload DEM (.tif)", type=["tif", "tiff"])
+    excel_file = st.file_uploader("Upload avalanche workbook (.xlsx)", type=["xlsx"])
+
+    st.header("Layer Controls")
+    show_slope_layer = st.checkbox("Show slope mask layer", value=True)
+    show_danger_layer = st.checkbox("Show avalanche danger layer", value=True)
+
+    st.header("Slope Filter")
+    slope_min = st.slider("Minimum slope (degrees)", 0, 89, 30)
+    slope_max = st.slider("Maximum slope (degrees)", 0, 89, 45)
+
+    st.header("Elevation Band Thresholds")
+    lower_max = st.number_input("Lower band max elevation", value=2400)
+    middle_max = st.number_input("Middle band max elevation", value=2900)
 
 # ------------------------------------------------------------
-# 7. COLOR MAPPING
+# Load workbook to populate selectors
 # ------------------------------------------------------------
+danger_df = None
+if excel_file is not None:
+    try:
+        danger_df = load_excel_data(excel_file)
+    except Exception as e:
+        st.error(f"Could not read Excel file: {e}")
 
-norm_min = danger_min / 90.0
-norm_max = danger_max / 90.0
+region = None
+forecast_date = None
 
-slope_colorscale = [
-    [0.0, "rgb(230, 230, 230)"],
-    [norm_min, "rgb(230, 230, 230)"],
-    [norm_min, "rgb(255, 255, 0)"],
-    [(norm_min + norm_max) / 2, "rgb(255, 165, 0)"],
-    [norm_max, "rgb(255, 0, 0)"],
-    [norm_max, "rgb(150, 150, 150)"],
-    [1.0, "rgb(100, 100, 100)"]
-]
+if danger_df is not None and not danger_df.empty:
+    with st.sidebar:
+        st.header("Forecast Selection")
 
-valid_z = Z[~np.isnan(Z)]
+        available_regions = sorted(danger_df["region"].dropna().unique().tolist())
+        default_region = "salt-lake" if "salt-lake" in available_regions else available_regions[0]
+        region = st.selectbox("Region", available_regions, index=available_regions.index(default_region))
 
-if len(valid_z) > 0:
-    z_min = float(np.nanmin(Z))
-    z_max = float(np.nanmax(Z))
+        region_dates = sorted(
+            danger_df.loc[danger_df["region"] == region, "forecast_date"].dropna().unique().tolist()
+        )
+        default_date = region_dates[-1]
+        forecast_date = st.selectbox("Forecast date", region_dates, index=region_dates.index(default_date))
+
+# ------------------------------------------------------------
+# Generate map
+# ------------------------------------------------------------
+if dem_file is not None and danger_df is not None and region is not None and forecast_date is not None:
+    try:
+        dem_info = read_dem(dem_file.getvalue())
+        dem = dem_info["dem"]
+        extent = dem_info["extent"]
+        xres = dem_info["xres"]
+        yres = dem_info["yres"]
+
+        danger_today = danger_df[
+            (danger_df["region"] == region) &
+            (danger_df["forecast_date"] == forecast_date)
+        ].copy()
+
+        if danger_today.empty:
+            st.warning("No DangerRose rows found for the selected region/date.")
+        else:
+            fig, slope_deg, aspect_deg, slope_mask = build_map(
+                dem=dem,
+                extent=extent,
+                xres=xres,
+                yres=yres,
+                region=region,
+                forecast_date=forecast_date,
+                danger_today=danger_today,
+                lower_max=lower_max,
+                middle_max=middle_max,
+                slope_min=slope_min,
+                slope_max=slope_max,
+                show_slope_layer=show_slope_layer,
+                show_danger_layer=show_danger_layer,
+            )
+
+            st.pyplot(fig, use_container_width=True)
+
+            # Summary stats
+            valid_pixels = np.isfinite(dem).sum()
+            slope_pixels = slope_mask.sum()
+            pct = (slope_pixels / valid_pixels * 100) if valid_pixels > 0 else 0
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Valid DEM pixels", f"{valid_pixels:,}")
+            col2.metric("Slope-mask pixels", f"{slope_pixels:,}")
+            col3.metric("Percent in slope range", f"{pct:.2f}%")
+
+            # PNG download
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=300, bbox_inches="tight")
+            buf.seek(0)
+
+            st.download_button(
+                label="Download map as PNG",
+                data=buf,
+                file_name=f"wasatch_avalanche_overlay_{region}_{forecast_date}.png",
+                mime="image/png",
+            )
+
+            with st.expander("Debug / Derived Layers"):
+                st.write("**DEM shape:**", dem.shape)
+                st.write("**Slope degrees** min/max:", float(np.nanmin(slope_deg)), float(np.nanmax(slope_deg)))
+                st.write("**Aspect degrees** min/max:", float(np.nanmin(aspect_deg)), float(np.nanmax(aspect_deg)))
+                st.write("**CRS:**", dem_info["crs"])
+
+    except Exception as e:
+        st.error(f"Error generating map: {e}")
 else:
-    z_min = 0
-    z_max = 1000
-
-contours_z = dict(
-    show=show_topo_lines,
-    start=math.floor(z_min / contour_interval) * contour_interval,
-    end=math.ceil(z_max / contour_interval) * contour_interval,
-    size=contour_interval,
-    color="black",
-    width=2,
-    usecolormap=False,
-    highlight=False,
-    project=dict(z=False)
-)
-
-# ------------------------------------------------------------
-# 8. PLOT
-# ------------------------------------------------------------
-
-fig = go.Figure(data=[go.Surface(
-    x=X,
-    y=Y,
-    z=Z,
-    surfacecolor=slope_deg,
-    colorscale=slope_colorscale,
-    cmin=0,
-    cmax=90,
-    contours=dict(
-        z=contours_z
-    ),
-    colorbar=dict(
-        title="Slope (°)",
-        ticksuffix="°"
-    )
-)])
-
-fig.update_layout(
-    scene=dict(
-        aspectmode="data",
-        xaxis_title="East-West Distance, meters",
-        yaxis_title="North-South Distance, meters",
-        zaxis_title="Elevation, meters"
-    ),
-    height=800,
-    margin=dict(l=0, r=0, b=0, t=0)
-)
-
-st.plotly_chart(fig, use_container_width=True)
+    st.info("Upload both a DEM GeoTIFF and the avalanche Excel workbook to get started.")
